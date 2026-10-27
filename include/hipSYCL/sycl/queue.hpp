@@ -37,6 +37,7 @@
 #include "detail/function_set.hpp"
 
 #include <cstddef>
+#include <cstdlib>
 #include <exception>
 #include <memory>
 #include <mutex>
@@ -1206,6 +1207,32 @@ private:
       if(_impl->dedicated_inorder_executor) {
         _impl->default_hints.set_hint(
             rt::hints::prefer_executor{_impl->dedicated_inorder_executor});
+      }
+
+      // In-order queues with a dedicated executor can track completion at
+      // queue granularity instead of recording a fine-grained backend event
+      // for every submission. All submissions in such a queue execute in
+      // stream order anyway, so per-submission events are only needed for
+      // conservative completion queries and external consumers; skipping
+      // them removes one backend event record from the per-launch hot path
+      // (measured ~7 us on the dfcs-gfx906/DTK stack).
+      // This is enabled by default for such queues. Semantics remain correct
+      // but event completion may be reported conservatively late.
+      // ACPP_RT_INORDER_FINE_GRAINED_EVENTS=1 restores per-submission events.
+      // Profiling queues always keep fine-grained events because event
+      // timestamps require them.
+      if(_impl->dedicated_inorder_executor &&
+         !this->has_property<property::queue::enable_profiling>()) {
+        static const bool inorder_fine_grained_events =
+            []() {
+              const char *value =
+                  std::getenv("ACPP_RT_INORDER_FINE_GRAINED_EVENTS");
+              return value && value[0] == '1';
+            }();
+        if(!inorder_fine_grained_events) {
+          _impl->default_hints.set_hint(
+              rt::hints::coarse_grained_synchronization{});
+        }
       }
     }
 
