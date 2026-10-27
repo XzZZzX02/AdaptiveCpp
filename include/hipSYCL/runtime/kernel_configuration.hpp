@@ -234,6 +234,16 @@ public:
     return result;
   }
 
+  /// Whether this configuration object carries no entries at all.
+  /// Used to decide whether a prepared-launch shortcut can be applied.
+  bool is_empty() const {
+    return _build_flags.empty() && _build_options.empty() &&
+           _specialized_kernel_args.empty() &&
+           _function_call_specializations.empty() &&
+           _kernel_param_flags.empty() && _known_alignments.empty() &&
+           _base_configuration_result == id_type{};
+  }
+
   const auto& build_options() const {
     return _build_options;
   }

@@ -25,6 +25,8 @@
 struct ihipStream_t;
 
 #include <string>
+#include <vector>
+#include <cstdint>
 
 namespace hipsycl {
 namespace rt {
@@ -138,6 +140,29 @@ private:
   glue::jit::cxx_argument_mapper _arg_mapper;
   kernel_configuration _config;
   glue::jit::reflection_map _reflection_map;
+
+  // Prepared-launch shortcut: repeated launches of the same kernel with the
+  // same arguments and launch geometry can reuse the computed kernel
+  // configuration ids instead of rebuilding the configuration from scratch.
+  // Only used when ACPP_ADAPTIVITY_LEVEL <= 1: at level 2 the invariant
+  // argument specialization (IADS) can change the configuration over time,
+  // so configurations must be re-evaluated on every launch.
+  struct sscp_prepared_launch {
+    bool valid = false;
+    hcf_object_id hcf_object = 0;
+    const rt::hcf_kernel_info *kernel_info = nullptr;
+    rt::range<3> num_groups{};
+    rt::range<3> group_size{};
+    unsigned local_mem_size = 0;
+    std::vector<uint8_t> args;
+    kernel_configuration::id_type binary_configuration_id{};
+    kernel_configuration::id_type code_object_configuration_id{};
+  };
+  static constexpr int _num_prepared_launches = 4;
+  sscp_prepared_launch _prepared_launches[_num_prepared_launches];
+  int _next_prepared_launch = 0;
+  int _adaptivity_level = 1;
+  unsigned _wavefront_size = 64;
 };
 
 }

@@ -88,9 +88,9 @@ class kernel_launcher
 {
 public:
   kernel_launcher(
-      const glue::kernel_launcher_data& static_data,
+      glue::kernel_launcher_data static_data,
       common::auto_small_vector<std::unique_ptr<backend_kernel_launcher>> kernels)
-  : _static_data{static_data}, _kernels{std::move(kernels)}
+  : _static_data{std::move(static_data)}, _kernels{std::move(kernels)}
   {}
 
   rt::result invoke(backend_id id, void *params,

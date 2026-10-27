@@ -92,7 +92,8 @@ make_kernel_launcher(sycl::id<Dim> offset, sycl::range<Dim> local_range,
     launchers.emplace_back(std::move(launcher));
   }
 #endif
-  return rt::kernel_launcher{static_launcher_data, std::move(launchers)};
+  return rt::kernel_launcher{std::move(static_launcher_data),
+                               std::move(launchers)};
 }
 }
 }

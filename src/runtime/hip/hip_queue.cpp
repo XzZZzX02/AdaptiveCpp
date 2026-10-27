@@ -11,10 +11,13 @@
 #include "hipSYCL/runtime/kernel_configuration.hpp"
 #include "hipSYCL/runtime/adaptivity_engine.hpp"
 #include "hipSYCL/runtime/hip/hip_target.hpp"
+#include "hipSYCL/runtime/application.hpp"
+#include "hipSYCL/runtime/settings.hpp"
 #include "hipSYCL/common/hcf_container.hpp"
 #include "hipSYCL/runtime/hip/hip_hardware_manager.hpp"
 #include "hipSYCL/runtime/hip/hip_queue.hpp"
 #include "hipSYCL/runtime/launch_profiler.hpp"
+#include <cstring>
 #include "hipSYCL/runtime/hip/hip_backend.hpp"
 #include "hipSYCL/runtime/error.hpp"
 #include "hipSYCL/runtime/hip/hip_event.hpp"
@@ -127,19 +130,15 @@ result launch_kernel_from_module(const hip_executable_object &code_object,
                                  hipStream_t stream, void **kernel_args,
                                  std::size_t *arg_sizes, std::size_t num_args) {
 
-  hipFunction_t kernel_func = nullptr;
+  ihipModuleSymbol_t *raw_function = nullptr;
   {
     rt::launch_profiler::scope _lp_get_function{
         rt::launch_profiler::slot::HipGetFunction};
-    kernel_func = reinterpret_cast<hipFunction_t>(
-        code_object.get_kernel_function(kernel_name));
+    result lookup_err = code_object.get_kernel_function(kernel_name, raw_function);
+    if (!lookup_err.is_success())
+      return lookup_err;
   }
-
-  if(!kernel_func) {
-    return make_error(__acpp_here(),
-                      error_info{"hip_queue: could not extract kernel from module",
-                                 error_code{"HIP", 0}});
-  }
+  hipFunction_t kernel_func = reinterpret_cast<hipFunction_t>(raw_function);
   hipError_t err;
 
   {
@@ -181,6 +180,9 @@ hip_queue::hip_queue(hip_backend *be, device_id dev, int priority)
       be->get_hardware_manager()->get_device(dev.get_id()));
   _event_pool = be->get_event_pool(dev);
   _target_arch = _hw_context->get_device_arch();
+  _wavefront_size = _hw_context->get_wavefront_size();
+  _adaptivity_level =
+      application::get_settings().get<setting::adaptivity_level>();
   _config.reserve_launch_buffers();
 
   _reflection_map = glue::jit::construct_default_reflection_map(
@@ -604,8 +606,6 @@ result hip_queue::submit_sscp_kernel_from_code_object(
   
   int device = _dev.get_id();
 
-  hip_hardware_context *ctx = _hw_context;
-
   const std::string &target_arch_name = _target_arch;
 
   if(!kernel_info) {
@@ -631,7 +631,39 @@ result hip_queue::submit_sscp_kernel_from_code_object(
 
   kernel_configuration::id_type binary_configuration_id;
   kernel_configuration::id_type code_object_configuration_id;
-  {
+
+  // Prepared-launch fast path: if we have launched exactly this kernel with
+  // these arguments and this launch geometry before, the configuration ids are
+  // identical and do not need to be recomputed.
+  // The argument blob is compared verbatim, which covers all values that
+  // influence the configuration (pointer values for alignment/allocation
+  // aliasing, specialized and function-call-specialization arguments).
+  const bool prepared_launch_usable =
+      initial_config.is_empty() && _adaptivity_level <= 1 && num_args == 1 &&
+      arg_sizes != nullptr && arg_sizes[0] > 0;
+  sscp_prepared_launch *prepared_launch = nullptr;
+  if (prepared_launch_usable) {
+    rt::launch_profiler::scope _lp_prepared{
+        rt::launch_profiler::slot::SscpPreparedLookup};
+    for (auto &entry : _prepared_launches) {
+      if (!entry.valid)
+        continue;
+      if (entry.hcf_object != hcf_object || entry.kernel_info != kernel_info ||
+          entry.num_groups != num_groups || entry.group_size != group_size ||
+          entry.local_mem_size != local_mem_size ||
+          entry.args.size() != arg_sizes[0])
+        continue;
+      if (std::memcmp(entry.args.data(), args[0], arg_sizes[0]) != 0)
+        continue;
+      prepared_launch = &entry;
+      break;
+    }
+  }
+
+  if (prepared_launch) {
+    binary_configuration_id = prepared_launch->binary_configuration_id;
+    code_object_configuration_id = prepared_launch->code_object_configuration_id;
+  } else {
     rt::launch_profiler::scope _lp_config_build{
         rt::launch_profiler::slot::SscpConfigBuild};
     kernel_adaptivity_engine adaptivity_engine{
@@ -656,7 +688,7 @@ result hip_queue::submit_sscp_kernel_from_code_object(
     _config.set_build_option(kernel_build_option::amdgpu_target_device,
                             target_arch_name);
     _config.set_build_option(kernel_build_option::desired_subgroup_size,
-                            ctx->get_wavefront_size());
+                            _wavefront_size);
 
     {
       rt::launch_profiler::scope _lp_config_finalize{
@@ -672,6 +704,11 @@ result hip_queue::submit_sscp_kernel_from_code_object(
 
   auto get_image_and_kernel_names =
       [&](std::vector<std::string> &contained_kernels) -> std::string {
+    // Only invoked when JIT compilation is required (cold path); recreate the
+    // adaptivity engine here so that the hot path does not pay for it.
+    kernel_adaptivity_engine adaptivity_engine{
+        hcf_object, kernel_name, kernel_info, _arg_mapper, num_groups,
+        group_size, args,        arg_sizes,   num_args, local_mem_size};
     return adaptivity_engine.select_image_and_kernels(&contained_kernels);
   };
 
@@ -738,6 +775,23 @@ result hip_queue::submit_sscp_kernel_from_code_object(
   if(!obj) {
     return make_error(__acpp_here(),
                       error_info{"hip_queue: Code object construction failed"});
+  }
+
+  if (prepared_launch_usable && !prepared_launch) {
+    sscp_prepared_launch &entry = _prepared_launches[_next_prepared_launch];
+    _next_prepared_launch =
+        (_next_prepared_launch + 1) % _num_prepared_launches;
+    entry.valid = false;
+    entry.hcf_object = hcf_object;
+    entry.kernel_info = kernel_info;
+    entry.num_groups = num_groups;
+    entry.group_size = group_size;
+    entry.local_mem_size = local_mem_size;
+    const uint8_t *arg_data = reinterpret_cast<const uint8_t *>(args[0]);
+    entry.args.assign(arg_data, arg_data + arg_sizes[0]);
+    entry.binary_configuration_id = binary_configuration_id;
+    entry.code_object_configuration_id = code_object_configuration_id;
+    entry.valid = true;
   }
 
   if(obj->get_jit_output_metadata().kernel_retained_arguments_indices.has_value()) {

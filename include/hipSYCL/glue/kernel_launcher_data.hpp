@@ -12,6 +12,7 @@
 #define HIPSYCL_LLVM_SSCP_KERNEL_LAUNCHER_DATA_HPP
 
 #include "hipSYCL/common/hcf_container.hpp"
+#include "hipSYCL/common/small_vector.hpp"
 #include "hipSYCL/runtime/util.hpp"
 #include "hipSYCL/runtime/kernel_type.hpp"
 #include "hipSYCL/runtime/error.hpp"
@@ -49,7 +50,9 @@ struct kernel_launcher_data {
   // data potentially shared by multiple launchers
   rt::kernel_type type;
   // has to be mutable e.g. to initialize accessors (embedded pointers)
-  mutable std::vector<uint8_t> kernel_args;
+  // Kernel arguments are typically small (serialized lambda captures).
+  // Use small-buffer storage to avoid a heap allocation per submission.
+  mutable common::small_vector<uint8_t, 64> kernel_args;
   rt::range<3> global_size; // <- indices must be flipped
   rt::range<3> group_size; // <- indices must be flipped
   unsigned local_mem_size;

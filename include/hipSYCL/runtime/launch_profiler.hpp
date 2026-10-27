@@ -56,6 +56,7 @@ enum class slot : int {
   HipGetFunction,
   HipLaunchKernel,
   KernelCacheGet,
+  SscpPreparedLookup,
   InstantSubmissionCount,
   TraditionalSubmissionCount,
   NumSlots

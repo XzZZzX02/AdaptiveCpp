@@ -40,8 +40,8 @@ const char *slot_names[num_slots] = {
     "hip_event_record",     "event_make_shared",    "hip_submit_kernel",
     "sscp_arg_map",         "sscp_config_build",    "sscp_config_finalize",
     "sscp_code_object_get", "sscp_launch_module",   "hip_get_function",
-    "hip_launch_kernel",    "kernel_cache_get",     "instant_submissions",
-    "traditional_submissions"};
+    "hip_launch_kernel",    "kernel_cache_get",     "sscp_prepared_lookup",
+    "instant_submissions",  "traditional_submissions"};
 
 struct report_writer {
   ~report_writer() {
