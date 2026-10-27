@@ -9,6 +9,7 @@
  */
 // SPDX-License-Identifier: BSD-2-Clause
 #include "hipSYCL/runtime/kernel_cache.hpp"
+#include <atomic>
 #include "hipSYCL/common/debug.hpp"
 #include "hipSYCL/common/filesystem.hpp"
 #include "hipSYCL/common/hcf_container.hpp"
@@ -22,6 +23,22 @@
 
 namespace hipsycl {
 namespace rt {
+
+namespace {
+
+// Small thread-local cache for the last code object id -> object mapping.
+// Kernel launches typically hit the same code object repeatedly; avoiding the
+// global kernel cache mutex on the hot path is worthwhile.
+// The cache is invalidated when the kernel cache is unloaded via a generation
+// counter.
+thread_local bool tls_cache_valid = false;
+thread_local kernel_cache::code_object_id tls_cached_id{};
+thread_local const code_object *tls_cached_object = nullptr;
+thread_local std::size_t tls_cached_generation = 0;
+
+std::atomic<std::size_t> code_object_cache_generation{0};
+
+} // anonymous namespace
 
 namespace {
 
@@ -451,14 +468,29 @@ std::shared_ptr<kernel_cache> kernel_cache::get() {
 }
 
 void kernel_cache::unload() {
+  // Invalidate thread-local fast path caches before dropping the objects.
+  code_object_cache_generation.fetch_add(1, std::memory_order_release);
   std::lock_guard<std::mutex> lock{_mutex};
 
   _code_objects.clear();
 }
 
 const code_object* kernel_cache::get_code_object(code_object_id id) const {
+  const std::size_t generation =
+      code_object_cache_generation.load(std::memory_order_acquire);
+  if (tls_cache_valid && tls_cached_generation == generation &&
+      tls_cached_id == id)
+    return tls_cached_object;
+
   std::lock_guard<std::mutex> lock{_mutex};
-  return get_code_object_impl(id);
+  const code_object *obj = get_code_object_impl(id);
+  if (obj) {
+    tls_cached_object = obj;
+    tls_cached_id = id;
+    tls_cached_generation = generation;
+    tls_cache_valid = true;
+  }
+  return obj;
 }
 
 const code_object* kernel_cache::get_code_object_impl(code_object_id id) const {

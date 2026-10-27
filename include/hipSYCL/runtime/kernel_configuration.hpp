@@ -141,6 +141,18 @@ public:
     _build_flags.push_back(flag);
   }
 
+  /// Pre-allocate buffers for the entries that backends append on every
+  /// kernel launch. Call once per configuration object (e.g. in the backend
+  /// queue constructor) to avoid repeated heap allocations on the hot path.
+  void reserve_launch_buffers() {
+    _build_options.reserve(8);
+    _build_flags.reserve(4);
+    _specialized_kernel_args.reserve(4);
+    _function_call_specializations.reserve(2);
+    _kernel_param_flags.reserve(8);
+    _known_alignments.reserve(4);
+  }
+
   void set_known_alignment(int param_index, int alignment) {
     for(auto& entry : _known_alignments) {
       if(entry.first == param_index) {

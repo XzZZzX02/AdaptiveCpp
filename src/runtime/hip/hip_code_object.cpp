@@ -54,6 +54,45 @@ result build_hip_module(ihipModule_t *&module, int device,
 }
 }
 
+ihipModuleSymbol_t *hip_executable_object::get_kernel_function(
+    std::string_view kernel_name) const {
+  {
+    std::lock_guard<std::mutex> lock{_function_cache_mutex};
+    if (_last_function && kernel_name == _last_kernel_name)
+      return _last_function;
+
+    if (!_function_cache.empty()) {
+      auto it = _function_cache.find(std::string{kernel_name});
+      if (it != _function_cache.end()) {
+        _last_function = it->second;
+        _last_kernel_name = kernel_name;
+        return it->second;
+      }
+    }
+  }
+
+  std::string kernel_name_str{kernel_name};
+  hipFunction_t function = nullptr;
+  hipError_t err =
+      hipModuleGetFunction(&function, get_module(), kernel_name_str.c_str());
+  if (err != hipSuccess) {
+    register_error(
+        __acpp_here(),
+        error_info{"hip_executable_object: could not extract kernel from module",
+                   error_code{"HIP", static_cast<int>(err)}});
+    return nullptr;
+  }
+
+  ihipModuleSymbol_t *result_function = function;
+  {
+    std::lock_guard<std::mutex> lock{_function_cache_mutex};
+    _function_cache.emplace(std::move(kernel_name_str), result_function);
+    _last_function = result_function;
+    _last_kernel_name = kernel_name;
+  }
+  return result_function;
+}
+
 hip_multipass_executable_object::~hip_multipass_executable_object() {
   unload_hip_module(_module, _device);
 }

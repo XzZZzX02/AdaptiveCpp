@@ -119,7 +119,7 @@ private:
   std::shared_ptr<dag_node_event> _task_start;
 };
 
-result launch_kernel_from_module(ihipModule_t *module,
+result launch_kernel_from_module(const hip_executable_object &code_object,
                                  std::string_view kernel_name,
                                  const rt::range<3> &grid_size,
                                  const rt::range<3> &block_size,
@@ -127,19 +127,20 @@ result launch_kernel_from_module(ihipModule_t *module,
                                  hipStream_t stream, void **kernel_args,
                                  std::size_t *arg_sizes, std::size_t num_args) {
 
-  hipFunction_t kernel_func;
-  hipError_t err;
+  hipFunction_t kernel_func = nullptr;
   {
     rt::launch_profiler::scope _lp_get_function{
         rt::launch_profiler::slot::HipGetFunction};
-    err = hipModuleGetFunction(&kernel_func, module, kernel_name.data());
+    kernel_func = reinterpret_cast<hipFunction_t>(
+        code_object.get_kernel_function(kernel_name));
   }
 
-  if(err != hipSuccess) {
+  if(!kernel_func) {
     return make_error(__acpp_here(),
                       error_info{"hip_queue: could not extract kernel from module",
-                                 error_code{"HIP", static_cast<int>(err)}});
+                                 error_code{"HIP", 0}});
   }
+  hipError_t err;
 
   {
   rt::launch_profiler::scope _lp_launch_kernel{
@@ -175,6 +176,12 @@ hip_queue::hip_queue(hip_backend *be, device_id dev, int priority)
       _multipass_code_object_invoker{this}, _sscp_code_object_invoker{this},
       _kernel_cache{kernel_cache::get()} {
   this->activate_device();
+
+  _hw_context = static_cast<hip_hardware_context *>(
+      be->get_hardware_manager()->get_device(dev.get_id()));
+  _event_pool = be->get_event_pool(dev);
+  _target_arch = _hw_context->get_device_arch();
+  _config.reserve_launch_buffers();
 
   _reflection_map = glue::jit::construct_default_reflection_map(
       be->get_hardware_manager()->get_device(dev.get_id()));
@@ -213,8 +220,7 @@ std::shared_ptr<dag_node_event> hip_queue::insert_event() {
   {
     rt::launch_profiler::scope _lp_event_pool{
         rt::launch_profiler::slot::EventPoolObtain};
-    auto event_creation_result =
-        _backend->get_event_pool(_dev)->obtain_event(evt);
+    auto event_creation_result = _event_pool->obtain_event(evt);
     if(!event_creation_result.is_success()) {
       register_error(event_creation_result);
       return nullptr;
@@ -235,8 +241,7 @@ std::shared_ptr<dag_node_event> hip_queue::insert_event() {
 
   rt::launch_profiler::scope _lp_event_alloc{
       rt::launch_profiler::slot::EventMakeShared};
-  return std::make_shared<hip_node_event>(_dev, std::move(evt),
-                                          _backend->get_event_pool(_dev));
+  return std::make_shared<hip_node_event>(_dev, std::move(evt), _event_pool);
 }
 
 std::shared_ptr<dag_node_event> hip_queue::create_queue_completion_event() {
@@ -583,9 +588,9 @@ result hip_queue::submit_multipass_kernel_from_code_object(
   // the full kernel name, and don't need to query available kernels in the device image
   // as in the CUDA backend.
   return launch_kernel_from_module(
-      static_cast<const hip_executable_object *>(obj)->get_module(),
-      backend_kernel_name, grid_size, block_size, dynamic_shared_mem, _stream,
-      kernel_args, arg_sizes, num_args);
+      *static_cast<const hip_executable_object *>(obj), backend_kernel_name,
+      grid_size, block_size, dynamic_shared_mem, _stream, kernel_args,
+      arg_sizes, num_args);
 }
 
 result hip_queue::submit_sscp_kernel_from_code_object(
@@ -599,10 +604,9 @@ result hip_queue::submit_sscp_kernel_from_code_object(
   
   int device = _dev.get_id();
 
-  hip_hardware_context *ctx = static_cast<hip_hardware_context *>(
-      this->_backend->get_hardware_manager()->get_device(device));
+  hip_hardware_context *ctx = _hw_context;
 
-  std::string target_arch_name = ctx->get_device_arch();
+  const std::string &target_arch_name = _target_arch;
 
   if(!kernel_info) {
     return make_error(
@@ -635,6 +639,7 @@ result hip_queue::submit_sscp_kernel_from_code_object(
         group_size, args,        arg_sizes,   num_args, local_mem_size};
 
     _config = initial_config;
+    _config.reserve_launch_buffers();
     _config.append_base_configuration(
         kernel_base_config_parameter::backend_id, backend_id::hip);
     _config.append_base_configuration(
@@ -750,7 +755,8 @@ result hip_queue::submit_sscp_kernel_from_code_object(
     rt::launch_profiler::scope _lp_launch_module{
         rt::launch_profiler::slot::SscpLaunchModule};
     err = launch_kernel_from_module(
-        module, kernel_name, num_groups, group_size, local_mem_size, _stream,
+        *static_cast<const hip_executable_object *>(obj), kernel_name,
+        num_groups, group_size, local_mem_size, _stream,
         _arg_mapper.get_mapped_args(),
         const_cast<std::size_t *>(_arg_mapper.get_mapped_arg_sizes()),
         _arg_mapper.get_mapped_num_args());

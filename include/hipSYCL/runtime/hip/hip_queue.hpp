@@ -24,11 +24,15 @@
 // Avoid including HIP headers to prevent conflicts with CUDA
 struct ihipStream_t;
 
+#include <string>
+
 namespace hipsycl {
 namespace rt {
 
 class hip_queue;
 class hip_backend;
+class hip_hardware_context;
+class hip_event_pool;
 
 class hip_multipass_code_object_invoker : public multipass_code_object_invoker {
 public:
@@ -121,6 +125,10 @@ private:
   ihipStream_t* _stream;
   host_timestamped_event _reference_event;
   hip_backend* _backend;
+  // Cached per-queue data that would otherwise be re-queried on every launch.
+  hip_hardware_context* _hw_context = nullptr;
+  hip_event_pool* _event_pool = nullptr;
+  std::string _target_arch;
   hip_multipass_code_object_invoker _multipass_code_object_invoker;
   hip_sscp_code_object_invoker _sscp_code_object_invoker;
   std::shared_ptr<kernel_cache> _kernel_cache;

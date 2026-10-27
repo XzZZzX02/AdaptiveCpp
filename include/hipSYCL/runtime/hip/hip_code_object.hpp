@@ -13,6 +13,9 @@
 
 #include <vector>
 #include <string>
+#include <string_view>
+#include <mutex>
+#include <unordered_map>
 
 #include "hipSYCL/runtime/kernel_configuration.hpp"
 #include "hipSYCL/runtime/error.hpp"
@@ -21,6 +24,7 @@
 
 
 struct ihipModule_t;
+struct ihipModuleSymbol_t;
 
 namespace hipsycl {
 namespace rt {
@@ -31,6 +35,20 @@ public:
   virtual ihipModule_t* get_module() const = 0;
   virtual result get_build_result() const = 0;
   virtual int get_device() const = 0;
+
+  /// Return the HIP function handle for a kernel in this code object.
+  /// The handle is cached per code object: the underlying module is immutable
+  /// for the lifetime of the object, so looking it up once is sufficient.
+  /// Returns nullptr (and reports an error) if the kernel cannot be found.
+  ihipModuleSymbol_t* get_kernel_function(std::string_view kernel_name) const;
+
+private:
+  mutable std::mutex _function_cache_mutex;
+  mutable std::unordered_map<std::string, ihipModuleSymbol_t*> _function_cache;
+  // Last-hit cache to keep the common case (same kernel launched repeatedly)
+  // free of heap allocation for the string lookup.
+  mutable std::string _last_kernel_name;
+  mutable ihipModuleSymbol_t* _last_function = nullptr;
 };
 
 class hip_multipass_executable_object : public hip_executable_object {
