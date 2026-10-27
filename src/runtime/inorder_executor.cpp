@@ -12,6 +12,7 @@
 
 #include "hipSYCL/runtime/inorder_executor.hpp"
 #include "hipSYCL/runtime/inorder_queue.hpp"
+#include "hipSYCL/runtime/launch_profiler.hpp"
 #include "hipSYCL/runtime/operations.hpp"
 #include "hipSYCL/runtime/serialization/serialization.hpp"
 
@@ -90,7 +91,10 @@ bool inorder_executor::is_taskgraph() const {
 
 void inorder_executor::submit_directly(const dag_node_ptr& node, operation *op,
                                        const node_list_t &reqs) {
-  
+
+  rt::launch_profiler::scope _lp_executor_submit{
+      rt::launch_profiler::slot::ExecutorSubmit};
+
   HIPSYCL_DEBUG_INFO << "inorder_executor: Processing node " << node.get()
 	  << " with " << reqs.size() << " non-virtual requirement(s) and "
 	  << node->get_requirements().size() << " direct requirement(s)." << std::endl;
@@ -177,11 +181,15 @@ void inorder_executor::submit_directly(const dag_node_ptr& node, operation *op,
     return;
   }
 
-  if (node->get_execution_hints()
-          .has_hint<hints::coarse_grained_synchronization>()) {
-    node->mark_submitted(_q->create_queue_completion_event());
-  } else {
-    node->mark_submitted(_q->insert_event());
+  {
+    rt::launch_profiler::scope _lp_insert_event{
+        rt::launch_profiler::slot::InsertEvent};
+    if (node->get_execution_hints()
+            .has_hint<hints::coarse_grained_synchronization>()) {
+      node->mark_submitted(_q->create_queue_completion_event());
+    } else {
+      node->mark_submitted(_q->insert_event());
+    }
   }
 }
 

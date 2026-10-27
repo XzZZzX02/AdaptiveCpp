@@ -35,6 +35,7 @@ add_library(acpp-rt SHARED
   data.cpp
   inorder_executor.cpp
   kernel_cache.cpp
+  launch_profiler.cpp
   kernel_configuration.cpp
   multi_queue_executor.cpp
   runtime_event_handlers.cpp

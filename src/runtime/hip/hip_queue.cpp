@@ -14,6 +14,7 @@
 #include "hipSYCL/common/hcf_container.hpp"
 #include "hipSYCL/runtime/hip/hip_hardware_manager.hpp"
 #include "hipSYCL/runtime/hip/hip_queue.hpp"
+#include "hipSYCL/runtime/launch_profiler.hpp"
 #include "hipSYCL/runtime/hip/hip_backend.hpp"
 #include "hipSYCL/runtime/error.hpp"
 #include "hipSYCL/runtime/hip/hip_event.hpp"
@@ -127,8 +128,12 @@ result launch_kernel_from_module(ihipModule_t *module,
                                  std::size_t *arg_sizes, std::size_t num_args) {
 
   hipFunction_t kernel_func;
-  hipError_t err =
-      hipModuleGetFunction(&kernel_func, module, kernel_name.data());
+  hipError_t err;
+  {
+    rt::launch_profiler::scope _lp_get_function{
+        rt::launch_profiler::slot::HipGetFunction};
+    err = hipModuleGetFunction(&kernel_func, module, kernel_name.data());
+  }
 
   if(err != hipSuccess) {
     return make_error(__acpp_here(),
@@ -136,6 +141,9 @@ result launch_kernel_from_module(ihipModule_t *module,
                                  error_code{"HIP", static_cast<int>(err)}});
   }
 
+  {
+  rt::launch_profiler::scope _lp_launch_kernel{
+      rt::launch_profiler::slot::HipLaunchKernel};
   err = hipModuleLaunchKernel(kernel_func, 
     static_cast<unsigned>(grid_size.get(0)),
                        static_cast<unsigned>(grid_size.get(1)),
@@ -144,6 +152,7 @@ result launch_kernel_from_module(ihipModule_t *module,
                        static_cast<unsigned>(block_size.get(1)),
                        static_cast<unsigned>(block_size.get(2)),
                        dynamic_shared_mem, stream, kernel_args, nullptr);
+  }
 
   if (err != hipSuccess) {
     return make_error(__acpp_here(),
@@ -201,21 +210,31 @@ hip_queue::~hip_queue() {
 /// Inserts an event into the stream
 std::shared_ptr<dag_node_event> hip_queue::insert_event() {
   hipEvent_t evt;
-  auto event_creation_result =
-      _backend->get_event_pool(_dev)->obtain_event(evt);
-  if(!event_creation_result.is_success()) {
-    register_error(event_creation_result);
-    return nullptr;
+  {
+    rt::launch_profiler::scope _lp_event_pool{
+        rt::launch_profiler::slot::EventPoolObtain};
+    auto event_creation_result =
+        _backend->get_event_pool(_dev)->obtain_event(evt);
+    if(!event_creation_result.is_success()) {
+      register_error(event_creation_result);
+      return nullptr;
+    }
   }
 
-  hipError_t err = hipEventRecord(evt, this->get_stream());
-  if (err != hipSuccess) {
-    register_error(
-        __acpp_here(),
-        error_info{"hip_queue: Couldn't record event", error_code{"HIP", err}});
-    return nullptr;
+  {
+    rt::launch_profiler::scope _lp_event_record{
+        rt::launch_profiler::slot::HipEventRecord};
+    hipError_t err = hipEventRecord(evt, this->get_stream());
+    if (err != hipSuccess) {
+      register_error(
+          __acpp_here(),
+          error_info{"hip_queue: Couldn't record event", error_code{"HIP", err}});
+      return nullptr;
+    }
   }
 
+  rt::launch_profiler::scope _lp_event_alloc{
+      rt::launch_profiler::slot::EventMakeShared};
   return std::make_shared<hip_node_event>(_dev, std::move(evt),
                                           _backend->get_event_pool(_dev));
 }
@@ -339,6 +358,9 @@ result hip_queue::submit_memcpy(memcpy_operation & op, const dag_node_ptr& node)
 }
 
 result hip_queue::submit_kernel(kernel_operation &op, const dag_node_ptr& node) {
+
+  rt::launch_profiler::scope _lp_hip_submit_kernel{
+      rt::launch_profiler::slot::HipSubmitKernel};
 
   this->activate_device();
   
@@ -590,7 +612,11 @@ result hip_queue::submit_sscp_kernel_from_code_object(
   }
 
 
-  _arg_mapper.construct_mapping(*kernel_info, args, arg_sizes, num_args);
+  {
+    rt::launch_profiler::scope _lp_arg_map{
+        rt::launch_profiler::slot::SscpArgMap};
+    _arg_mapper.construct_mapping(*kernel_info, args, arg_sizes, num_args);
+  }
 
   if(!_arg_mapper.mapping_available()) {
     return make_error(
@@ -599,34 +625,45 @@ result hip_queue::submit_sscp_kernel_from_code_object(
             "hip_queue: Could not map C++ arguments to kernel arguments"});
   }
 
-  kernel_adaptivity_engine adaptivity_engine{
-      hcf_object, kernel_name, kernel_info, _arg_mapper, num_groups,
-      group_size, args,        arg_sizes,   num_args, local_mem_size};
-  
-  _config = initial_config;
-  _config.append_base_configuration(
-      kernel_base_config_parameter::backend_id, backend_id::hip);
-  _config.append_base_configuration(
-      kernel_base_config_parameter::compilation_flow,
-      compilation_flow::sscp);
-  _config.append_base_configuration(
-      kernel_base_config_parameter::hcf_object_id, hcf_object);
+  kernel_configuration::id_type binary_configuration_id;
+  kernel_configuration::id_type code_object_configuration_id;
+  {
+    rt::launch_profiler::scope _lp_config_build{
+        rt::launch_profiler::slot::SscpConfigBuild};
+    kernel_adaptivity_engine adaptivity_engine{
+        hcf_object, kernel_name, kernel_info, _arg_mapper, num_groups,
+        group_size, args,        arg_sizes,   num_args, local_mem_size};
 
-  for(const auto& flag : kernel_info->get_compilation_flags())
-    _config.set_build_flag(flag);
-  for(const auto& opt : kernel_info->get_compilation_options())
-    _config.set_build_option(opt.first, opt.second);
+    _config = initial_config;
+    _config.append_base_configuration(
+        kernel_base_config_parameter::backend_id, backend_id::hip);
+    _config.append_base_configuration(
+        kernel_base_config_parameter::compilation_flow,
+        compilation_flow::sscp);
+    _config.append_base_configuration(
+        kernel_base_config_parameter::hcf_object_id, hcf_object);
 
-  _config.set_build_option(kernel_build_option::amdgpu_target_device,
-                          target_arch_name);
-  _config.set_build_option(kernel_build_option::desired_subgroup_size,
-                          ctx->get_wavefront_size());
+    for(const auto& flag : kernel_info->get_compilation_flags())
+      _config.set_build_flag(flag);
+    for(const auto& opt : kernel_info->get_compilation_options())
+      _config.set_build_option(opt.first, opt.second);
 
-  auto binary_configuration_id = adaptivity_engine.finalize_binary_configuration(_config);
-  auto code_object_configuration_id = binary_configuration_id;
-  kernel_configuration::extend_hash(
-      code_object_configuration_id,
-      kernel_base_config_parameter::runtime_device, device);
+    _config.set_build_option(kernel_build_option::amdgpu_target_device,
+                            target_arch_name);
+    _config.set_build_option(kernel_build_option::desired_subgroup_size,
+                            ctx->get_wavefront_size());
+
+    {
+      rt::launch_profiler::scope _lp_config_finalize{
+          rt::launch_profiler::slot::SscpConfigFinalize};
+      binary_configuration_id =
+          adaptivity_engine.finalize_binary_configuration(_config);
+      code_object_configuration_id = binary_configuration_id;
+      kernel_configuration::extend_hash(
+          code_object_configuration_id,
+          kernel_base_config_parameter::runtime_device, device);
+    }
+  }
 
   auto get_image_and_kernel_names =
       [&](std::vector<std::string> &contained_kernels) -> std::string {
@@ -683,9 +720,14 @@ result hip_queue::submit_sscp_kernel_from_code_object(
     return exec_obj;
   };
 
-  const code_object *obj = _kernel_cache->get_or_construct_jit_code_object(
-      code_object_configuration_id, binary_configuration_id,
-      jit_compiler, code_object_constructor);
+  const code_object *obj = nullptr;
+  {
+    rt::launch_profiler::scope _lp_code_object{
+        rt::launch_profiler::slot::SscpCodeObjectLookup};
+    obj = _kernel_cache->get_or_construct_jit_code_object(
+        code_object_configuration_id, binary_configuration_id,
+        jit_compiler, code_object_constructor);
+  }
 
   
   if(!obj) {
@@ -703,11 +745,16 @@ result hip_queue::submit_sscp_kernel_from_code_object(
       static_cast<const hip_executable_object *>(obj)->get_module();
   assert(module);
 
-  auto err = launch_kernel_from_module(
-      module, kernel_name, num_groups, group_size, local_mem_size, _stream,
-      _arg_mapper.get_mapped_args(),
-      const_cast<std::size_t *>(_arg_mapper.get_mapped_arg_sizes()),
-      _arg_mapper.get_mapped_num_args());
+  result err;
+  {
+    rt::launch_profiler::scope _lp_launch_module{
+        rt::launch_profiler::slot::SscpLaunchModule};
+    err = launch_kernel_from_module(
+        module, kernel_name, num_groups, group_size, local_mem_size, _stream,
+        _arg_mapper.get_mapped_args(),
+        const_cast<std::size_t *>(_arg_mapper.get_mapped_arg_sizes()),
+        _arg_mapper.get_mapped_num_args());
+  }
 
   on_kernel_launch_complete(kernel_name, obj);
   return err;

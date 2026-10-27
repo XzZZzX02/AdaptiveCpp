@@ -20,6 +20,7 @@
 #include "hipSYCL/runtime/hints.hpp"
 #include "hipSYCL/runtime/inorder_executor.hpp"
 #include "hipSYCL/runtime/inorder_queue.hpp"
+#include "hipSYCL/runtime/launch_profiler.hpp"
 #include "hipSYCL/runtime/runtime.hpp"
 #include "hipSYCL/sycl/backend.hpp"
 #include "types.hpp"
@@ -395,6 +396,8 @@ public:
 
   template <typename T>
   event submit(const property_list& prop_list, T cgf) {
+    rt::launch_profiler::scope _lp_submit_total{
+        rt::launch_profiler::slot::QueueSubmitTotal};
     std::lock_guard<std::mutex> lock{_impl->lock};
 
     rt::execution_hints hints = _impl->default_hints;
@@ -452,8 +455,13 @@ public:
 
     this->get_hooks()->run_all(cgh);
 
-    rt::dag_node_ptr node = execute_submission(cgf, cgh);
-    
+    rt::dag_node_ptr node;
+    {
+      rt::launch_profiler::scope _lp_execute_submission{
+          rt::launch_profiler::slot::ExecuteSubmission};
+      node = execute_submission(cgf, cgh);
+    }
+
     return event{node, _impl->handler};
   }
 

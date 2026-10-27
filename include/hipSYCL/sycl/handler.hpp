@@ -43,6 +43,7 @@
 #include "hipSYCL/runtime/operations.hpp"
 #include "hipSYCL/runtime/application.hpp"
 #include "hipSYCL/runtime/dag_manager.hpp"
+#include "hipSYCL/runtime/launch_profiler.hpp"
 #include "hipSYCL/runtime/dag_node.hpp"
 #include "hipSYCL/runtime/device_id.hpp"
 #include "hipSYCL/runtime/executor.hpp"
@@ -1173,6 +1174,9 @@ private:
                                const rt::execution_hints &hints,
                                const rt::requirements_list& requirements) {
 
+    rt::launch_profiler::scope _lp_create_task{
+        rt::launch_profiler::slot::CreateTask};
+
     bool uses_buffers = false;
     bool has_non_instant_dependency = false;
     bool is_unbound = !hints.has_hint<rt::hints::bind_to_device>();
@@ -1199,6 +1203,8 @@ private:
         !is_dedicated_in_order_queue ||
         op->is_requirement()) {
       // traditional submission
+      rt::launch_profiler::increment(
+          rt::launch_profiler::slot::TraditionalSubmissionCount);
       rt::dag_build_guard build{_rt->dag()};
       _contains_non_instant_nodes = true;
 
@@ -1213,6 +1219,8 @@ private:
       // Remember this was instant submission
       node->get_execution_hints().set_hint(rt::hints::instant_execution{});
 
+      rt::launch_profiler::increment(
+          rt::launch_profiler::slot::InstantSubmissionCount);
       executor->submit_directly(node, node->get_operation(), requirements.get());
       // Signal that instrumentation setup phase is complete
       node->get_operation()->get_instrumentations().mark_set_complete();
