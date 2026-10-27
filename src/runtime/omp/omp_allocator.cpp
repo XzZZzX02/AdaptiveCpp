@@ -142,7 +142,15 @@ static bool has_warned = false;
 #ifdef __APPLE__
   return aligned_alloc(min_alignment, size_bytes);
 #elif !defined(_WIN32)
-  return std::aligned_alloc(min_alignment, size_bytes);
+  // std::aligned_alloc is not available with CentOS 7's libstdc++/glibc;
+  // use posix_memalign instead (min_alignment is a power of two >= sizeof(void*)).
+  min_alignment = power_of_2_ceil(min_alignment);
+  if (min_alignment < sizeof(void *))
+    min_alignment = sizeof(void *);
+  void *ptr = nullptr;
+  if (posix_memalign(&ptr, min_alignment, size_bytes) != 0)
+    return nullptr;
+  return ptr;
 #else
   min_alignment = power_of_2_ceil(min_alignment);
   return _aligned_malloc(size_bytes, min_alignment);

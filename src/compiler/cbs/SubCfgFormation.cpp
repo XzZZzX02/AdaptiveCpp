@@ -200,8 +200,11 @@ void fillStores(llvm::Value *V, int Idx, bool IsIdxBytewise,
                 llvm::SmallVector<llvm::Value *, 3> &LocalSize) {
   if (auto *Store = llvm::dyn_cast<llvm::StoreInst>(V)) {
 #if LLVM_VERSION_MAJOR >= 17
+    // The LLVM 17 fork shipped with DTK (and the lichen LLVM 17 tree) does not
+    // provide StoreInst::getAccessType(); the access type of a store is simply
+    // the type of the stored value.
     if (IsIdxBytewise)
-      Idx /= Store->getAccessType()->getScalarSizeInBits() / 8;
+      Idx /= Store->getValueOperand()->getType()->getScalarSizeInBits() / 8;
 #endif
     LocalSize[Idx] = Store->getOperand(0);
   } else if (auto *BC = llvm::dyn_cast<llvm::BitCastInst>(V)) {
