@@ -154,12 +154,24 @@ private:
     rt::range<3> num_groups{};
     rt::range<3> group_size{};
     unsigned local_mem_size = 0;
-    std::vector<uint8_t> args;
+    // Values that can influence the configuration: pointer values (alignment /
+    // allocation aliasing), plus values of parameters annotated as
+    // specialized / function-call-specialization. Ordinary scalar values are
+    // deliberately not part of the signature: at adaptivity level <= 1 they do
+    // not affect the configuration, so kernels whose scalar arguments change
+    // every launch can still reuse the prepared descriptor.
+    std::vector<uint64_t> signature;
+    // Code object and kernel function are immutable for the lifetime of the
+    // kernel cache (unload only happens at runtime shutdown), so they can be
+    // reused directly by the prepared-launch fast path.
+    const rt::code_object *object = nullptr;
+    void *function = nullptr;
     kernel_configuration::id_type binary_configuration_id{};
     kernel_configuration::id_type code_object_configuration_id{};
   };
   static constexpr int _num_prepared_launches = 4;
   sscp_prepared_launch _prepared_launches[_num_prepared_launches];
+  std::vector<uint64_t> _prepared_signature_scratch;
   int _next_prepared_launch = 0;
   int _adaptivity_level = 1;
   unsigned _wavefront_size = 64;

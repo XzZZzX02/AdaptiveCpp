@@ -10,6 +10,7 @@
 // SPDX-License-Identifier: BSD-2-Clause
 #include "hipSYCL/runtime/kernel_configuration.hpp"
 #include "hipSYCL/runtime/adaptivity_engine.hpp"
+#include "hipSYCL/runtime/allocation_tracker.hpp"
 #include "hipSYCL/runtime/hip/hip_target.hpp"
 #include "hipSYCL/runtime/application.hpp"
 #include "hipSYCL/runtime/settings.hpp"
@@ -18,6 +19,7 @@
 #include "hipSYCL/runtime/hip/hip_queue.hpp"
 #include "hipSYCL/runtime/launch_profiler.hpp"
 #include <cstring>
+#include <algorithm>
 #include "hipSYCL/runtime/hip/hip_backend.hpp"
 #include "hipSYCL/runtime/error.hpp"
 #include "hipSYCL/runtime/hip/hip_event.hpp"
@@ -128,17 +130,21 @@ result launch_kernel_from_module(const hip_executable_object &code_object,
                                  const rt::range<3> &block_size,
                                  unsigned dynamic_shared_mem,
                                  hipStream_t stream, void **kernel_args,
-                                 std::size_t *arg_sizes, std::size_t num_args) {
+                                 std::size_t *arg_sizes, std::size_t num_args,
+                                 ihipModuleSymbol_t *cached_function = nullptr) {
 
-  ihipModuleSymbol_t *raw_function = nullptr;
-  {
+  hipFunction_t kernel_func = nullptr;
+  if (cached_function) {
+    kernel_func = reinterpret_cast<hipFunction_t>(cached_function);
+  } else {
+    ihipModuleSymbol_t *raw_function = nullptr;
     rt::launch_profiler::scope _lp_get_function{
         rt::launch_profiler::slot::HipGetFunction};
     result lookup_err = code_object.get_kernel_function(kernel_name, raw_function);
     if (!lookup_err.is_success())
       return lookup_err;
+    kernel_func = reinterpret_cast<hipFunction_t>(raw_function);
   }
-  hipFunction_t kernel_func = reinterpret_cast<hipFunction_t>(raw_function);
   hipError_t err;
 
   {
@@ -184,6 +190,7 @@ hip_queue::hip_queue(hip_backend *be, device_id dev, int priority)
   _adaptivity_level =
       application::get_settings().get<setting::adaptivity_level>();
   _config.reserve_launch_buffers();
+  _prepared_signature_scratch.reserve(16);
 
   _reflection_map = glue::jit::construct_default_reflection_map(
       be->get_hardware_manager()->get_device(dev.get_id()));
@@ -592,8 +599,63 @@ result hip_queue::submit_multipass_kernel_from_code_object(
   return launch_kernel_from_module(
       *static_cast<const hip_executable_object *>(obj), backend_kernel_name,
       grid_size, block_size, dynamic_shared_mem, _stream, kernel_args,
-      arg_sizes, num_args);
+      arg_sizes, num_args, nullptr);
 }
+
+
+namespace {
+
+bool build_prepared_signature(const rt::hcf_kernel_info *kernel_info,
+                              const glue::jit::cxx_argument_mapper &arg_mapper,
+                              std::vector<uint64_t> &out) {
+  out.clear();
+  if (!kernel_info)
+    return false;
+  void *const *mapped = arg_mapper.get_mapped_args();
+  const std::size_t num_params = kernel_info->get_num_parameters();
+  for (std::size_t i = 0; i < num_params; ++i) {
+    const bool is_pointer = kernel_info->get_argument_type(i) ==
+                            rt::hcf_kernel_info::argument_type::pointer;
+    bool specialized = false;
+    bool fcall = false;
+    for (auto a : kernel_info->get_known_annotations(i)) {
+      if (a == rt::hcf_kernel_info::annotation_type::specialized)
+        specialized = true;
+      if (a == rt::hcf_kernel_info::annotation_type::fcall_specialized_config)
+        fcall = true;
+    }
+    const std::size_t arg_size = kernel_info->get_argument_size(i);
+    if (is_pointer && arg_size == sizeof(void *)) {
+      void *ptr = nullptr;
+      std::memcpy(&ptr, mapped[i], sizeof(void *));
+      uint64_t base = 0;
+      rt::allocation_info ainfo;
+      if (ptr && rt::allocation_tracker::query_allocation(ptr, ainfo, base)) {
+        out.push_back(base);
+      } else {
+        out.push_back(reinterpret_cast<uint64_t>(ptr));
+      }
+      // Auto-alignment specialization only distinguishes >=32-byte alignment.
+      out.push_back(ptr && (reinterpret_cast<uint64_t>(ptr) & 31) == 0 ? 1 : 0);
+      continue;
+    }
+    bool include = specialized || fcall;
+    if (!include)
+      continue;
+    const auto *bytes = static_cast<const unsigned char *>(mapped[i]);
+    const std::size_t chunks = (arg_size + sizeof(uint64_t) - 1) / sizeof(uint64_t);
+    for (std::size_t c = 0; c < chunks; ++c) {
+      uint64_t v = 0;
+      const std::size_t off = c * sizeof(uint64_t);
+      const std::size_t n = std::min(sizeof(uint64_t), arg_size - off);
+      std::memcpy(&v, bytes + off, n);
+      out.push_back(v);
+    }
+  }
+  return true;
+}
+
+} // anonymous namespace
 
 result hip_queue::submit_sscp_kernel_from_code_object(
     hcf_object_id hcf_object, std::string_view kernel_name,
@@ -639,21 +701,20 @@ result hip_queue::submit_sscp_kernel_from_code_object(
   // influence the configuration (pointer values for alignment/allocation
   // aliasing, specialized and function-call-specialization arguments).
   const bool prepared_launch_usable =
-      initial_config.is_empty() && _adaptivity_level <= 1 && num_args == 1 &&
-      arg_sizes != nullptr && arg_sizes[0] > 0;
+      initial_config.is_empty() && _adaptivity_level <= 1;
   sscp_prepared_launch *prepared_launch = nullptr;
   if (prepared_launch_usable) {
     rt::launch_profiler::scope _lp_prepared{
         rt::launch_profiler::slot::SscpPreparedLookup};
+    build_prepared_signature(kernel_info, _arg_mapper, _prepared_signature_scratch);
     for (auto &entry : _prepared_launches) {
       if (!entry.valid)
         continue;
       if (entry.hcf_object != hcf_object || entry.kernel_info != kernel_info ||
           entry.num_groups != num_groups || entry.group_size != group_size ||
-          entry.local_mem_size != local_mem_size ||
-          entry.args.size() != arg_sizes[0])
+          entry.local_mem_size != local_mem_size)
         continue;
-      if (std::memcmp(entry.args.data(), args[0], arg_sizes[0]) != 0)
+      if (entry.signature != _prepared_signature_scratch)
         continue;
       prepared_launch = &entry;
       break;
@@ -763,7 +824,12 @@ result hip_queue::submit_sscp_kernel_from_code_object(
   };
 
   const code_object *obj = nullptr;
-  {
+  ihipModuleSymbol_t *cached_function = nullptr;
+  if (prepared_launch) {
+    obj = prepared_launch->object;
+    cached_function =
+        static_cast<ihipModuleSymbol_t *>(prepared_launch->function);
+  } else {
     rt::launch_profiler::scope _lp_code_object{
         rt::launch_profiler::slot::SscpCodeObjectLookup};
     obj = _kernel_cache->get_or_construct_jit_code_object(
@@ -787,8 +853,17 @@ result hip_queue::submit_sscp_kernel_from_code_object(
     entry.num_groups = num_groups;
     entry.group_size = group_size;
     entry.local_mem_size = local_mem_size;
-    const uint8_t *arg_data = reinterpret_cast<const uint8_t *>(args[0]);
-    entry.args.assign(arg_data, arg_data + arg_sizes[0]);
+    entry.signature = _prepared_signature_scratch;
+    ihipModuleSymbol_t *function = nullptr;
+    result fn_result =
+        static_cast<const hip_executable_object *>(obj)->get_kernel_function(
+            kernel_name, function);
+    if (!fn_result.is_success()) {
+      register_error(fn_result);
+      return fn_result;
+    }
+    entry.object = obj;
+    entry.function = function;
     entry.binary_configuration_id = binary_configuration_id;
     entry.code_object_configuration_id = code_object_configuration_id;
     entry.valid = true;
@@ -813,7 +888,7 @@ result hip_queue::submit_sscp_kernel_from_code_object(
         num_groups, group_size, local_mem_size, _stream,
         _arg_mapper.get_mapped_args(),
         const_cast<std::size_t *>(_arg_mapper.get_mapped_arg_sizes()),
-        _arg_mapper.get_mapped_num_args());
+        _arg_mapper.get_mapped_num_args(), cached_function);
   }
 
   on_kernel_launch_complete(kernel_name, obj);
